@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -21,19 +23,44 @@ __all__ = [
     "verify_activation_callback",
     "verify_telr",
 ]
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 DEFAULT_BASE_URL = "https://matheel.app"
 
 
-class MatheelError(Exception):
-    """An API answer other than 200: carries the HTTP status, the parsed body and the error code."""
+# What the caller should do with an error, per the API contract (https://matheel.app/llms.txt).
+_RETRY_CODES = frozenset({
+    "network_error", "invalid_response", "device_token_reused", "filing_in_progress", "filing_outcome_unknown",
+    "zatca_unavailable", "filing_failed", "billing_unavailable", "sandbox_rate_limited",
+})
+_PERMANENT_CODES = frozenset({"zatca_rejected", "invalid", "missing_fields", "invalid_amount", "validation_failed"})
 
-    def __init__(self, status: int, body: Any):
+
+class MatheelError(Exception):
+    """A failed call: an API answer other than 200 (status, parsed body, code), or status 0 for a network failure."""
+
+    def __init__(self, status: int, body: Any, retry_after: Optional[float] = None):
         self.status = status
         self.body = body
         self.code = _error_code(status, body)
+        self.retry_after = retry_after
         super().__init__(f"Matheel {status}: {self.code}")
+
+    @property
+    def retryable(self) -> str:
+        """``"retry"`` (resend the same request later), ``"permanent"`` (fix the document) or ``"attention"`` (a person must act)."""
+        if self.code in _RETRY_CODES:
+            return "retry"
+        if self.code in _PERMANENT_CODES:
+            return "permanent"
+        if self.status in (0, 429) or self.status >= 500:
+            return "retry"
+        return "attention"  # 401 key/certificate, 402 plan, 409 previous_filing_unknown, anything unknown
+
+
+def _invalid_response(raw: Any) -> MatheelError:
+    """The MatheelError for an answer that is not the API's JSON (an HTML page, a 200 with no device_token)."""
+    return MatheelError(502, {"error": "invalid_response", "raw": raw})
 
 
 def _error_code(status: int, body: Any) -> str:
@@ -82,27 +109,33 @@ class Matheel:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
 
-    def _send(self, path: str, body: Mapping[str, Any]) -> Tuple[int, Any]:
-        """POSTs JSON and returns (status, parsed body); tests override this to mock HTTP."""
+    def _send(self, path: str, body: Mapping[str, Any]) -> Tuple[int, Any, Optional[str]]:
+        """POSTs JSON and returns (status, parsed body, Retry-After header); tests override this to mock HTTP."""
         headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": f"matheel-python/{__version__}"}
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
         req = urllib.request.Request(self.base_url + path, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=_tls_context()) as res:
-                status, raw = res.status, res.read()
-        except urllib.error.HTTPError as e:
-            status, raw = e.code, e.read()
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout, context=_tls_context()) as res:
+                    status, raw, retry_after = res.status, res.read(), res.headers.get("Retry-After")
+            except urllib.error.HTTPError as e:
+                status, raw, retry_after = e.code, e.read(), e.headers.get("Retry-After") if e.headers else None
+        except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+            # URLError, DNS, timeouts, resets and TLS failures: the request may have reached Matheel, so resend it.
+            raise MatheelError(0, {"error": "network_error", "message": str(e)}) from e
         try:
-            return status, json.loads(raw) if raw else {}
+            return status, json.loads(raw) if raw else {}, retry_after
         except ValueError:
-            return status, {"error": "invalid_json", "raw": raw.decode("utf-8", "replace")}
+            return status, {"error": "invalid_json", "raw": raw.decode("utf-8", "replace")}, retry_after
 
     def post(self, path: str, body: Mapping[str, Any]) -> Any:
-        """POSTs JSON to an API path and returns the parsed body; raises MatheelError on any status but 200."""
-        status, parsed = self._send(path, body)
+        """POSTs JSON to an API path and returns the parsed body; raises MatheelError on any status but 200 (0 = network)."""
+        status, parsed, retry_after = self._send(path, body)
         if status != 200:
-            raise MatheelError(status, parsed)
+            raise MatheelError(status, parsed, _seconds(retry_after))
+        if not isinstance(parsed, dict) or parsed.get("error") == "invalid_json":
+            raise _invalid_response(parsed.get("raw") if isinstance(parsed, dict) else parsed)
         return parsed
 
     def file_invoice(self, invoice: Mapping[str, Any], device_token: Optional[str] = None, pdf: Optional[bool] = None, **fields: Any) -> dict:
@@ -112,19 +145,49 @@ class Matheel:
             body["device_token"] = device_token
         if pdf is not None:
             body["pdf"] = pdf
-        return self.post("/api/v1/invoices", body)
+        res = self.post("/api/v1/invoices", body)
+        # A device filing always answers with the next token; without one the answer did not come from the API.
+        if device_token and not isinstance(res.get("device_token"), str):
+            raise _invalid_response(res)
+        return res
 
-    def file_with_store(self, store: TokenStore, invoice: Mapping[str, Any], pdf: Optional[bool] = None, retries: int = 3, **fields: Any) -> dict:
-        """Files with the token in ``store``: writes the new token on 200, re-reads and retries on 409 device_token_reused."""
+    def file_with_store(
+        self,
+        store: TokenStore,
+        invoice: Mapping[str, Any],
+        pdf: Optional[bool] = None,
+        retries: int = 3,
+        uuid: Optional[str] = None,
+        **fields: Any,
+    ) -> dict:
+        """Files with the token in ``store``, writes the next token on 200, and resends on 409 (stale token, filing in progress).
+
+        Up to ``retries`` times: 409 device_token_reused stores ``latest_device_token`` and resends; filing_in_progress
+        waits Retry-After (max 10 s) and resends. ``uuid`` is put into an invoice that has none: pass one per document.
+        """
+        if uuid and not invoice.get("uuid"):
+            invoice = {**invoice, "uuid": uuid}
+        token = store.read()
         attempt = 0
         while True:
             try:
-                res = self.file_invoice(invoice, device_token=store.read(), pdf=pdf, **fields)
+                res = self.file_invoice(invoice, device_token=token, pdf=pdf, **fields)
             except MatheelError as e:
-                if e.status == 409 and e.code == "device_token_reused" and attempt < retries:
-                    attempt += 1
-                    continue
-                raise  # any other error: the stored token is left as it was
+                if e.status != 409 or attempt >= retries:
+                    raise  # the stored token is left as it was
+                attempt += 1
+                error = e.body.get("error") if isinstance(e.body, dict) else None
+                latest = error.get("latest_device_token") if isinstance(error, dict) else None
+                if e.code == "device_token_reused" and latest:
+                    store.write(latest)
+                    token = latest
+                elif e.code == "device_token_reused":
+                    token = store.read()  # no latest token in the answer: another writer may have stored it
+                elif e.code == "filing_in_progress":
+                    time.sleep(min(e.retry_after if e.retry_after is not None else 5, 10))
+                else:
+                    raise
+                continue
             if res.get("device_token"):
                 store.write(res["device_token"])
             return res
@@ -153,6 +216,15 @@ class Matheel:
             if value:
                 body[name] = value
         return self.post("/api/v1/onboarding/links", body)
+
+
+def _seconds(header: Optional[str]) -> Optional[float]:
+    """Retry-After as non-negative seconds, or None when absent or not a number."""
+    try:
+        value = float(header) if header else None
+    except ValueError:
+        return None
+    return value if value is not None and value >= 0 else None
 
 
 @dataclass(frozen=True)

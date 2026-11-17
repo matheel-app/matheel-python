@@ -4,7 +4,11 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
+import ssl
 import unittest
+import urllib.error
+from unittest import mock
 
 from matheel_zatca import Matheel, MatheelError, decode_qr, verify_activation_callback, verify_telr
 
@@ -17,7 +21,7 @@ def tlv(tag, value):
 
 
 class MockMatheel(Matheel):
-    """A client whose transport answers from a queue of (status, body) and records each request."""
+    """A client whose transport answers from a queue of (status, body[, retry_after]) and records each request."""
 
     def __init__(self, answers, **kwargs):
         super().__init__(**kwargs)
@@ -26,7 +30,8 @@ class MockMatheel(Matheel):
 
     def _send(self, path, body):
         self.calls.append((path, json.loads(json.dumps(body))))
-        return self.answers.pop(0)
+        answer = self.answers.pop(0)
+        return answer if len(answer) == 3 else (*answer, None)
 
 
 class MemoryStore:
@@ -125,6 +130,89 @@ class FileWithStoreTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, "device_token_reused")
         self.assertEqual(len(m.calls), 4)
         self.assertEqual(store.writes, [])
+
+
+class ContractTest(unittest.TestCase):
+    """The 0.2.0 server contract: latest token, filing in progress, network errors, invalid answers, classification."""
+
+    def test_409_latest_token_is_stored_and_used_and_uuid_fills_the_invoice(self):
+        stale = {"error": {"code": "device_token_reused", "latest_device_token": "mdt1.latest", "latest_counter": 7}}
+        m = MockMatheel([(409, stale), (200, {"status": "reported", "device_token": "mdt1.next", "counter": 8})])
+        store = MemoryStore("mdt1.old")
+        res = m.file_with_store(store, {"type": "simplified"}, uuid="u-1")
+        self.assertEqual(res["counter"], 8)
+        self.assertEqual(store.writes, ["mdt1.latest", "mdt1.next"])
+        self.assertEqual([c[1]["device_token"] for c in m.calls], ["mdt1.old", "mdt1.latest"])
+        self.assertEqual([c[1]["invoice"]["uuid"] for c in m.calls], ["u-1", "u-1"])
+        own = MockMatheel([(200, {"device_token": "t"})])
+        own.file_with_store(MemoryStore("x"), {"uuid": "own"}, uuid="u-1")
+        self.assertEqual(own.calls[0][1]["invoice"]["uuid"], "own")
+
+    def test_filing_in_progress_waits_retry_after_capped_and_resends_the_same_request(self):
+        busy = {"error": {"code": "filing_in_progress"}}
+        m = MockMatheel([(409, busy, "5"), (409, busy, "60"), (200, {"device_token": "mdt1.next"})])
+        store = MemoryStore("mdt1.old")
+        with mock.patch("matheel_zatca.time.sleep") as sleep:
+            m.file_with_store(store, {"uuid": "u-1"})
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5.0, 10])
+        self.assertEqual([c[1] for c in m.calls], [{"invoice": {"uuid": "u-1"}, "device_token": "mdt1.old"}] * 3)
+        self.assertEqual(store.writes, ["mdt1.next"])
+
+    def test_in_progress_is_bounded_and_previous_unknown_is_not_retried(self):
+        m = MockMatheel([(409, {"error": {"code": "filing_in_progress"}}, "1")] * 5)
+        with mock.patch("matheel_zatca.time.sleep"), self.assertRaises(MatheelError) as cm:
+            m.file_with_store(MemoryStore("t"), {}, retries=2)
+        self.assertEqual((cm.exception.code, cm.exception.retry_after, len(m.calls)), ("filing_in_progress", 1.0, 3))
+        prev = MockMatheel([(409, {"error": {"code": "previous_filing_unknown", "uuid": "earlier"}})])
+        with self.assertRaises(MatheelError) as cm:
+            prev.file_with_store(MemoryStore("t"), {})
+        self.assertEqual((cm.exception.retryable, cm.exception.body["error"]["uuid"], len(prev.calls)), ("attention", "earlier", 1))
+
+    def test_network_failures_become_status_0_network_error(self):
+        failures = [
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known")),
+            TimeoutError("timed out"),
+            socket.timeout("timed out"),
+            ConnectionResetError(104, "Connection reset by peer"),
+            ssl.SSLError("UNEXPECTED_EOF_WHILE_READING"),
+        ]
+        for failure in failures:
+            store = MemoryStore("mdt1.old")
+            with mock.patch("urllib.request.urlopen", side_effect=failure), self.assertRaises(MatheelError) as cm:
+                Matheel().file_with_store(store, {})
+            self.assertEqual((cm.exception.status, cm.exception.code, cm.exception.retryable), (0, "network_error", "retry"))
+            self.assertIs(cm.exception.__cause__, failure)
+            self.assertEqual(store.writes, [])
+        # Nothing listens on port 1: the real transport fails the same way.
+        with self.assertRaises(MatheelError) as cm:
+            Matheel(base_url="https://127.0.0.1:1", timeout=5).file_invoice({})
+        self.assertEqual((cm.exception.status, cm.exception.code), (0, "network_error"))
+
+    def test_a_200_that_is_not_the_api_answer_is_invalid_response(self):
+        html = {"error": "invalid_json", "raw": "<!DOCTYPE html><html>Login to Wi-Fi</html>"}
+        for body in (html, {"status": "reported"}, None, [1]):
+            store = MemoryStore("mdt1.old")
+            with self.assertRaises(MatheelError) as cm:
+                MockMatheel([(200, body)]).file_with_store(store, {})
+            self.assertEqual((cm.exception.status, cm.exception.code, cm.exception.retryable), (502, "invalid_response", "retry"))
+            self.assertEqual(store.writes, [])
+        # Without a device_token (keyless sandbox, own credentials) a JSON 200 with no token is fine.
+        self.assertEqual(MockMatheel([(200, {"status": "reported"})]).file_invoice({})["status"], "reported")
+
+    def test_retryable_follows_the_contract(self):
+        cases = [
+            (0, "network_error", "retry"), (502, "invalid_response", "retry"), (504, {"code": "filing_outcome_unknown"}, "retry"),
+            (503, {"code": "zatca_unavailable"}, "retry"), (429, "sandbox_rate_limited", "retry"), (500, "boom", "retry"),
+            (409, {"code": "device_token_reused"}, "retry"), (409, {"code": "filing_in_progress"}, "retry"),
+            (422, {"code": "filing_failed"}, "retry"), (422, {"code": "zatca_rejected"}, "permanent"),
+            (422, {"code": "invalid"}, "permanent"), (422, {"code": "missing_fields"}, "permanent"),
+            (422, {"code": "invalid_amount"}, "permanent"), (422, {"code": "validation_failed"}, "permanent"),
+            (401, "invalid_api_key", "attention"), (401, {"code": "invalid_csid"}, "attention"),
+            (402, "production_plan_required", "attention"), (409, {"code": "previous_filing_unknown"}, "attention"),
+        ]
+        for status, error, expected in cases:
+            self.assertEqual(MatheelError(status, {"error": error}).retryable, expected, (status, error))
+        self.assertEqual(MatheelError(422, {"status": "rejected", "errors": [{"code": "BR-KSA-33"}]}).retryable, "permanent")
 
 
 class RequestBodyTest(unittest.TestCase):
