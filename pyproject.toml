@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "matheel-zatca"
-version = "0.1.1"
+version = "0.1.2"
 description = "Official client for the Matheel ZATCA Phase 2 e-invoicing API (Saudi Arabia, Fatoora): file invoices with a device token, decode the QR, verify callbacks."
 readme = "README.md"
 license = { file = "LICENSE" }

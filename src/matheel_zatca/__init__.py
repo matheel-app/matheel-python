@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ __all__ = [
     "verify_activation_callback",
     "verify_telr",
 ]
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 DEFAULT_BASE_URL = "https://matheel.app"
 
@@ -59,6 +60,20 @@ class TokenStore(Protocol):
         ...
 
 
+def _tls_context() -> ssl.SSLContext:
+    """Verified TLS with a classic X25519 key share.
+
+    Some networks between a cloud host and Matheel's edge drop the large post-quantum ClientHello that OpenSSL 3.5
+    sends by default (measured 2026-11-17: Python on OpenSSL 3.5 failed with UNEXPECTED_EOF, X25519 succeeded).
+    """
+    ctx = ssl.create_default_context()
+    try:
+        ctx.set_ecdh_curve("X25519")
+    except (ValueError, ssl.SSLError):  # an OpenSSL build without X25519 keeps its defaults
+        pass
+    return ctx
+
+
 class Matheel:
     """A client for the Matheel API; ``key`` is optional on the sandbox."""
 
@@ -74,7 +89,7 @@ class Matheel:
             headers["Authorization"] = f"Bearer {self.key}"
         req = urllib.request.Request(self.base_url + path, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as res:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=_tls_context()) as res:
                 status, raw = res.status, res.read()
         except urllib.error.HTTPError as e:
             status, raw = e.code, e.read()
